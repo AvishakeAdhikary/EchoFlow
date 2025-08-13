@@ -343,8 +343,8 @@ class VoiceAIServer:
         
         # OpenAI client configuration (update with your settings)
         self.openai_client = AsyncOpenAI(
-            base_url="http://51.159.133.130/v1",
-            api_key="zoyel-medgemma-27b-it-miniontek"
+            base_url="http://localhost/v1",
+            api_key="custom-api-key"
         )
 
     def _get_session_lock(self, session_id: str) -> asyncio.Lock:
