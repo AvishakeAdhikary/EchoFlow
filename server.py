@@ -58,6 +58,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# System instruction to be applied to every chat completion
+SYSTEM_PROMPT = """
+You are Zoya, a helpful medical AI assistant who communicates through voice.
+Important instructions for your responses:
+1) Provide only plain text that will be converted to speech - never use markdown, asterisk *, code blocks, or special formatting.
+2) Use natural, conversational language as if you're speaking to someone.
+3) Never use bullet points, numbered lists, or special characters.
+4) Keep responses concise and clear since they will be spoken aloud.
+5) Express lists or multiple points in a natural spoken way using words like 'first', 'also', 'finally', etc.
+6) Use punctuation only for natural speech pauses (periods, commas, question marks).
+"""
+
 @dataclass
 class Message:
     id: str
@@ -78,7 +90,8 @@ class Session:
     context: List[Dict]
     model_name: str
     temperature: float = 0.3
-    max_tokens: int = 2000
+    max_tokens: int = 256
+    context_max_tokens: int = 128000
     is_active: bool = True
 
 class DatabaseManager:
@@ -157,9 +170,15 @@ class DatabaseManager:
             
             if row:
                 return Session(
-                    id=row[0], user_id=row[1], created_at=row[2], last_activity=row[3],
-                    context=json.loads(row[4]) if row[4] else [], model_name=row[5],
-                    temperature=row[6], max_tokens=row[7], is_active=bool(row[8])
+                    id=row[0],
+                    user_id=row[1],
+                    created_at=row[2],
+                    last_activity=row[3],
+                    context=json.loads(row[4]) if row[4] else [],
+                    model_name=row[5],
+                    temperature=row[6],
+                    max_tokens=row[7],
+                    is_active=bool(row[8])
                 )
         return None
     
@@ -319,12 +338,102 @@ class VoiceAIServer:
         self.mcp = ModelContextProtocol()
         self.sessions: Dict[str, Session] = {}
         self.connected_clients: Dict[str, websockets.WebSocketServerProtocol] = {}
+        # Per-session locks to serialize processing and avoid role alternation errors
+        self.session_locks: Dict[str, asyncio.Lock] = {}
         
         # OpenAI client configuration (update with your settings)
         self.openai_client = AsyncOpenAI(
-            base_url="http://localhost/v1",
-            api_key="custom-api-key"
+            base_url="http://51.159.133.130/v1",
+            api_key="zoyel-medgemma-27b-it-miniontek"
         )
+
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Get or create an asyncio.Lock for a session id."""
+        lock = self.session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.session_locks[session_id] = lock
+        return lock
+
+    def _normalize_context(self, context: List[Dict]) -> List[Dict]:
+        """Normalize context to strictly alternate roles (user <-> assistant),
+        drop leading assistant messages, merge consecutive same-role messages,
+        without applying a fixed history cap.
+        """
+        normalized: List[Dict] = []
+        for msg in context:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role not in ("user", "assistant"):
+                continue
+            if not content:
+                continue
+            if not normalized:
+                if role == "assistant":
+                    # Drop leading assistant
+                    continue
+                normalized.append({"role": role, "content": content})
+            else:
+                last_role = normalized[-1]["role"]
+                if last_role == role:
+                    # Merge consecutive same-role messages to avoid alternation errors
+                    normalized[-1]["content"] = normalized[-1]["content"] + "\n\n" + content
+                else:
+                    normalized.append({"role": role, "content": content})
+        return normalized
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Lightweight token estimator: ~4 chars per token (conservative)."""
+        if not text:
+            return 0
+        # Add 1 to avoid zero for very short strings
+        return max(1, len(text) // 4)
+
+    def _truncate_messages_to_token_limit(self, messages: List[Dict], max_tokens: int) -> List[Dict]:
+        """Keep the tail of messages so that the estimated total tokens <= max_tokens.
+        Ensures we don't start with an assistant message after truncation.
+        """
+        total = 0
+        kept_rev: List[Dict] = []
+        for msg in reversed(messages):
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role not in ("user", "assistant"):
+                continue
+            t = self._estimate_tokens(content) + 4  # small per-message overhead
+            if total + t > max_tokens:
+                # If nothing kept yet and this single message exceeds limit, truncate its tail
+                if not kept_rev and max_tokens > 0:
+                    char_limit = max_tokens * 4
+                    kept_rev.append({"role": role, "content": content[-char_limit:]})
+                    total = max_tokens
+                break
+            kept_rev.append({"role": role, "content": content})
+            total += t
+
+        kept = list(reversed(kept_rev))
+        if kept and kept[0].get("role") == "assistant":
+            kept = kept[1:]
+        return kept
+
+    def _build_messages_for_api(self, session: Session) -> List[Dict]:
+        """Prepend system prompt and include normalized context, truncated to fit
+        the configured context window minus reserved output tokens.
+        """
+        convo = self._normalize_context(session.context)
+
+        # Reserve output tokens and some overhead so input+output stays within context
+        overhead_tokens = self._estimate_tokens(SYSTEM_PROMPT) + 64
+        available_for_context = max(
+            0,
+            session.context_max_tokens - session.max_tokens - overhead_tokens
+        )
+
+        convo = self._truncate_messages_to_token_limit(convo, available_for_context)
+
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(convo)
+        return messages
     
     async def register_client(self, websocket, session_id: str):
         """Register a new client connection"""
@@ -350,6 +459,12 @@ class VoiceAIServer:
             if session:
                 self.sessions[session_id] = session
                 session.last_activity = datetime.now()
+                # Normalize any previously stored context to ensure alternation
+                session.context = self._normalize_context(session.context)
+                # Enforce configured generation token cap for this model
+                if session.model_name == "google/medgemma-27b-it" and session.max_tokens != 256:
+                    session.max_tokens = 256
+                    self.db.save_session(session)
                 return session
         
         # Create new session
@@ -376,11 +491,14 @@ class VoiceAIServer:
                 "role": message.role,
                 "content": message.content
             })
+
+            # Normalize context prior to API call to prevent any alternating-role issues
+            session.context = self._normalize_context(session.context)
             
             # Call OpenAI-compatible API
             response = await self.openai_client.chat.completions.create(
                 model=session.model_name,
-                messages=session.context,
+                messages=self._build_messages_for_api(session),
                 temperature=session.temperature,
                 max_tokens=session.max_tokens
             )
@@ -412,10 +530,8 @@ class VoiceAIServer:
                 "role": "assistant",
                 "content": ai_content
             })
-            
-            # Limit context size
-            if len(session.context) > 20:
-                session.context = session.context[-20:]
+            # Normalize and limit context size
+            session.context = self._normalize_context(session.context)
             
             # Save to database
             self.db.save_message(response_message)
@@ -438,74 +554,23 @@ class VoiceAIServer:
             # Get or create session
             session = await self.get_or_create_session(user_id, session_id)
             
-            if message_type == "text_message":
-                # Handle text message
-                content = message_data.get("content", "")
-                
-                user_message = Message(
-                    id=str(uuid.uuid4()),
-                    session_id=session.id,
-                    role="user",
-                    content=content,
-                    timestamp=datetime.now(),
-                    message_type="text"
-                )
-                
-                # Save user message
-                self.db.save_message(user_message)
-                
-                # Process and get AI response
-                ai_response = await self.process_message(session, user_message)
-                
-                if ai_response:
-                    # Send text response
-                    await websocket.send(json.dumps({
-                        "type": "text_response",
-                        "content": ai_response.content,
-                        "session_id": session.id,
-                        "message_id": ai_response.id
-                    }))
+            # Serialize processing per session to avoid concurrent completions
+            async with self._get_session_lock(session.id):
+                if message_type == "text_message":
+                    # Handle text message
+                    content = message_data.get("content", "")
                     
-                    # Generate and send audio response
-                    audio_data = await self.voice_processor.text_to_speech(ai_response.content)
-                    if audio_data:
-                        audio_b64 = base64.b64encode(audio_data).decode('utf-8')
-                        await websocket.send(json.dumps({
-                            "type": "audio_response",
-                            "audio_data": audio_b64,
-                            "session_id": session.id,
-                            "message_id": ai_response.id
-                        }))
-            
-            elif message_type == "audio_message":
-                # Handle audio message
-                audio_b64 = message_data.get("audio_data", "")
-                audio_data = base64.b64decode(audio_b64)
-                
-                # Convert speech to text
-                text_content = await self.voice_processor.speech_to_text(audio_data)
-                
-                if text_content:
                     user_message = Message(
                         id=str(uuid.uuid4()),
                         session_id=session.id,
                         role="user",
-                        content=text_content,
+                        content=content,
                         timestamp=datetime.now(),
-                        message_type="audio",
-                        audio_data=audio_data
+                        message_type="text"
                     )
                     
                     # Save user message
                     self.db.save_message(user_message)
-                    
-                    # Send transcription back to client
-                    await websocket.send(json.dumps({
-                        "type": "transcription",
-                        "content": text_content,
-                        "session_id": session.id,
-                        "message_id": user_message.id
-                    }))
                     
                     # Process and get AI response
                     ai_response = await self.process_message(session, user_message)
@@ -529,24 +594,77 @@ class VoiceAIServer:
                                 "session_id": session.id,
                                 "message_id": ai_response.id
                             }))
-            
-            elif message_type == "get_history":
-                # Send conversation history
-                messages = self.db.get_session_messages(session.id)
-                history = []
-                for msg in messages:
-                    history.append({
-                        "role": msg.role,
-                        "content": msg.content,
-                        "timestamp": msg.timestamp.isoformat(),
-                        "message_type": msg.message_type
-                    })
                 
-                await websocket.send(json.dumps({
-                    "type": "history",
-                    "messages": history,
-                    "session_id": session.id
-                }))
+                elif message_type == "audio_message":
+                    # Handle audio message
+                    audio_b64 = message_data.get("audio_data", "")
+                    audio_data = base64.b64decode(audio_b64)
+                    
+                    # Convert speech to text
+                    text_content = await self.voice_processor.speech_to_text(audio_data)
+                    
+                    if text_content:
+                        user_message = Message(
+                            id=str(uuid.uuid4()),
+                            session_id=session.id,
+                            role="user",
+                            content=text_content,
+                            timestamp=datetime.now(),
+                            message_type="audio",
+                            audio_data=audio_data
+                        )
+                        
+                        # Save user message
+                        self.db.save_message(user_message)
+                        
+                        # Send transcription back to client
+                        await websocket.send(json.dumps({
+                            "type": "transcription",
+                            "content": text_content,
+                            "session_id": session.id,
+                            "message_id": user_message.id
+                        }))
+                        
+                        # Process and get AI response
+                        ai_response = await self.process_message(session, user_message)
+                        
+                        if ai_response:
+                            # Send text response
+                            await websocket.send(json.dumps({
+                                "type": "text_response",
+                                "content": ai_response.content,
+                                "session_id": session.id,
+                                "message_id": ai_response.id
+                            }))
+                            
+                            # Generate and send audio response
+                            audio_data = await self.voice_processor.text_to_speech(ai_response.content)
+                            if audio_data:
+                                audio_b64 = base64.b64encode(audio_data).decode('utf-8')
+                                await websocket.send(json.dumps({
+                                    "type": "audio_response",
+                                    "audio_data": audio_b64,
+                                    "session_id": session.id,
+                                    "message_id": ai_response.id
+                                }))
+                
+                elif message_type == "get_history":
+                    # Send conversation history
+                    messages = self.db.get_session_messages(session.id)
+                    history = []
+                    for msg in messages:
+                        history.append({
+                            "role": msg.role,
+                            "content": msg.content,
+                            "timestamp": msg.timestamp.isoformat(),
+                            "message_type": msg.message_type
+                        })
+                    
+                    await websocket.send(json.dumps({
+                        "type": "history",
+                        "messages": history,
+                        "session_id": session.id
+                    }))
             
         except Exception as e:
             logger.error(f"Error handling client message: {e}")
