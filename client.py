@@ -361,7 +361,7 @@ class VoiceAIClientGUI:
         self.current_audio_level = 0
         
         # Server configuration
-        self.server_url = "ws://51.159.146.41:8765"  # Default server
+        self.server_url = "ws://localhost:8765"  # Default server
         
         # Setup GUI
         self.setup_styles()
